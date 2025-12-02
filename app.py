@@ -1,1 +1,241 @@
-import streamlit as st\nimport google.generativeai as genai\nfrom notion_client import Client\nimport pandas as pd\nimport requests\nimport datetime\nimport time\nimport threading\nfrom urllib.parse import quote\n\n# ==============================================================================\n# 1. CONFIGURATION & SECRETS\n# ==============================================================================\ntry:\n    # Récupération des clés\n    NOTION_KEY = st.secrets[\"NOTION_KEY\"]\n    NOTION_DB_TASKS = st.secrets[\"NOTION_DB_TASKS_ID\"]\n    NOTION_DB_RAPPELS = st.secrets[\"NOTION_DB_RAPPELS_ID\"]\n    GEMINI_KEY = st.secrets[\"GEMINI_KEY\"]\n    BREVO_KEY = st.secrets[\"BREVO_KEY\"]\n    # Optionnel\n    MACRODROID_URL = st.secrets.get(\"MACRODROID_URL\", \"\") \n    \n    # Emails\n    SENDER_EMAIL = st.secrets[\"SENDER_EMAIL\"]\n    TEST_DESTINATAIRE = st.secrets[\"TEST_DESTINATAIRE\"]\nexcept Exception as e:\n    st.error(f\"⚠️ CLÉS MANQUANTES ! Veuillez configurer les 'Secrets'.\\nErreur: {e}\")\n    st.stop()\n\n# Init API Clients\nnotion = Client(auth=NOTION_KEY)\ngenai.configure(api_key=GEMINI_KEY)\n\n# ==============================================================================\n# 2. CERVEAU IA (PROMPT SYSTÈME)\n# ==============================================================================\nSYSTEM_PROMPT = \"\"\"\nTu es l'IA centrale de l'association Cor-Tech à Cordemais.\nTu remplaces les bénévoles manquants. Tu es autonome, proactif et expert tech.\n\nTES MISSIONS :\n1. ADMINISTRATIF : Rédiger emails, PV d'AG, dossiers subventions, synthèses PDF.\n2. COM : Créer posts FB/LinkedIn/Twitter, newsletters HTML, communiqués presse.\n3. TECH : Expert 3D, Arduino, Code, Gaming. Tu peux débugger et expliquer.\n4. GESTION : Planning salles, gestion bénévoles, idées ateliers.\n5. VISUEL : Tu sais décrire des images pour les générer.\n\nTON STYLE :\n- Pro mais sympa (Esprit Maker/Asso).\n- Tu signes \"Ton Assistant Cor-Tech 🤖\".\n- Tu utilises le contexte de l'asso (Lutte fracture numérique, Gaming, Labo Ludik).\n\"\"\"\n\n# ==============================================================================\n# 3. FONCTIONS TECHNIQUES\n# ==============================================================================\n\ndef send_email_brevo(sujet, html_content, to_email):\n    \"\"\"Envoie un mail HTML via Brevo\"\"\"\n    url = \"https://api.brevo.com/v3/smtp/email\"\n    payload = {\n        \"sender\": {\"name\": \"IA Cor-Tech\", \"email\": SENDER_EMAIL},\n        \"to\": [{\"email\": to_email}],\n        \"subject\": sujet,\n        \"htmlContent\": f\"<html><body>{html_content}</body></html>\"\n    }\n    headers = {\"api-key\": BREVO_KEY, \"content-type\": \"application/json\"}\n    try:\n        r = requests.post(url, json=payload, headers=headers)\n        return r.status_code == 201\n    except:\n        return False\n\ndef send_sms_android(numero, message):\n    \"\"\"Envoie un SMS via passerelle Android (MacroDroid)\"\"\"\n    if not MACRODROID_URL: return False\n    try:\n        clean_num = numero.replace(\" \", \"\").replace(\".\", \"\")\n        params = {\"param1\": clean_num, \"param2\": message}\n        requests.get(MACRODROID_URL, params=params)\n        return True\n    except:\n        return False\n\ndef generate_image_url(prompt):\n    \"\"\"Génère une image via Pollinations\"\"\"\n    encoded = quote(prompt)\n    return f\"https://image.pollinations.ai/prompt/{encoded}?nologo=true\"\n\ndef add_notion_task(nom, responsable, priorite, frequence):\n    try:\n        notion.pages.create(\n            parent={\"database_id\": NOTION_DB_TASKS},\n            properties={\n                \"Nom\": {\"title\": [{\"text\": {\"content\": nom}}]},\n                \"Responsable\": {\"rich_text\": [{\"text\": {\"content\": responsable}}]},\n                \"Priorite\": {\"select\": {\"name\": priorite}},\n                \"Frequence\": {\"select\": {\"name\": frequence}},\n                \"Statut\": {\"status\": {\"name\": \"À faire\"}}\n            }\n        )\n        return True\n    except: return False\n\ndef add_notion_rappel(msg, dest, jour):\n    try:\n        notion.pages.create(\n            parent={\"database_id\": NOTION_DB_RAPPELS},\n            properties={\n                \"Message\": {\"title\": [{\"text\": {\"content\": msg}}]},\n                \"Destinataire\": {\"rich_text\": [{\"text\": {\"content\": dest}}]},\n                \"Jour\": {\"select\": {\"name\": jour}},\n                \"Actif\": {\"checkbox\": True}\n            }\n        )\n        return True\n    except: return False\n\n# ==============================================================================\n# 4. MOTEUR D'AUTOMATISATION\n# ==============================================================================\n@st.cache_resource\ndef start_daily_scheduler():\n    def scheduler_loop():\n        print(\"⏰ Démarrage du Cron Job interne...\")\n        last_check_date = None\n        while True:\n            now = datetime.datetime.now()\n            today_str = now.strftime(\"%Y-%m-%d\")\n            if last_check_date != today_str and now.hour >= 9:\n                print(f\"--- Tâches auto du {today_str} ---\")\n                jours_fr = [\"Lundi\", \"Mardi\", \"Mercredi\", \"Jeudi\", \"Vendredi\", \"Samedi\", \"Dimanche\"]\n                jour_actuel = jours_fr[now.weekday()]\n                try:\n                    query = notion.databases.query(\n                        database_id=NOTION_DB_RAPPELS,\n                        filter={\"and\": [{\"property\": \"Actif\", \"checkbox\": {\"equals\": True}}, {\"property\": \"Jour\", \"select\": {\"equals\": jour_actuel}}]}\n                    )\n                    results = query.get(\"results\", [])\n                    for page in results:\n                        props = page[\"properties\"]\n                        msg = props[\"Message\"][\"title\"][0][\"text\"][\"content\"]\n                        dest = props[\"Destinataire\"][\"rich_text\"][0][\"text\"][\"content\"]\n                        send_email_brevo(f\"🔔 Rappel Cor-Tech : {msg}\", f\"<p>C'est {jour_actuel}, pense à : <b>{msg}</b></p>\", dest)\n                        print(f\"✅ Rappel envoyé à {dest}\")\n                except Exception as e:\n                    print(f\"❌ Erreur Scheduler : {e}\")\n                last_check_date = today_str\n            time.sleep(3600) \n    t = threading.Thread(target=scheduler_loop, daemon=True)\n    t.start()\n    return t\n\nstart_daily_scheduler()\n\n# ==============================================================================\n# 5. INTERFACE GRAPHIQUE\n# ==============================================================================\nst.set_page_config(page_title=\"Cor-Tech OS\", page_icon=\"🤖\", layout=\"wide\")\n\nst.title(\"🚀 Cor-Tech : Centre de Commandement\")\nst.caption(\"Agent Autonome Actif • Surveillance des rappels en cours...\")\n\ntabs = st.tabs([\"💬 Assistant\", \"🛠️ Tâches\", \"⏰ Rappels\", \"⚙️ Admin\"])\n\n# --- TAB 1 : CHAT ---\nwith tabs[0]:\n    st.info(\"💡 Commandes : 'Visuel pour l'atelier', 'Rédige un mail', 'Synthétise'...\")\n    if \"messages\" not in st.session_state: st.session_state.messages = []\n    for msg in st.session_state.messages:\n        with st.chat_message(msg[\"role\"]):\n            if \"image\" in msg: st.image(msg[\"image\"])\n            st.markdown(msg[\"content\"])\n            \n    if prompt := st.chat_input(\"Votre ordre ?\"):\n        st.session_state.messages.append({\"role\": \"user\", \"content\": prompt})\n        with st.chat_message(\"user\"): st.markdown(prompt)\n        \n        # --- MODÈLE GEMINI 1.5 FLASH (Plus stable) ---\n        model = genai.GenerativeModel('gemini-1.5-flash')\n        \n        if \"visuel\" in prompt.lower() or \"affiche\" in prompt.lower() or \"image\" in prompt.lower():\n            prompt_img_gen = f\"Crée une description en anglais courte (prompt) pour générer une image : {prompt}\"\n            img_desc = model.generate_content(prompt_img_gen).text\n            img_url = generate_image_url(img_desc)\n            with st.chat_message(\"assistant\"):\n                st.image(img_url, caption=\"Visuel généré par IA\")\n                st.markdown(f\"[Télécharger]({img_url})\")\n            st.session_state.messages.append({\"role\": \"assistant\", \"content\": \"Visuel généré.\", \"image\": img_url})\n        else:\n            try:\n                response = model.generate_content(f\"{SYSTEM_PROMPT}\\nHistorique: {st.session_state.messages}\\nUser: {prompt}\")\n                with st.chat_message(\"assistant\"): st.markdown(response.text)\n                st.session_state.messages.append({\"role\": \"assistant\", \"content\": response.text})\n            except Exception as e:\n                st.error(f\"Erreur Gemini : {e}\")\n\n# --- TAB 2 : TACHES ---\nwith tabs[1]:\n    with st.form(\"tache\"):\n        c1, c2 = st.columns(2)\n        n = c1.text_input(\"Quoi faire ?\")\n        r = c2.text_input(\"Qui ?\", \"Sébastien\")\n        p = c1.selectbox(\"Priorité\", [\"Moyenne\", \"Haute\", \"Urgente\"])\n        f = c2.selectbox(\"Fréquence\", [\"Ponctuel\", \"Hebdo\"])\n        if st.form_submit_button(\"Ajouter\"):\n            if add_notion_task(n, r, p, f): st.success(\"✅ Tâche ajoutée\")\n            else: st.error(\"Erreur Notion\")\n\n# --- TAB 3 : RAPPELS ---\nwith tabs[2]:\n    with st.form(\"rappel\"):\n        c1, c2 = st.columns(2)\n        m = c1.text_input(\"Message\")\n        d = c2.text_input(\"Email\", TEST_DESTINATAIRE)\n        j = st.selectbox(\"Jour\", [\"Lundi\", \"Mardi\", \"Mercredi\", \"Jeudi\", \"Vendredi\", \"Samedi\", \"Dimanche\"])\n        if st.form_submit_button(\"Programmer\"):\n            if add_notion_rappel(m, d, j): st.success(\"✅ Rituel programmé\")\n            else: st.error(\"Erreur Notion\")\n\n# --- TAB 4 : ADMIN ---\nwith tabs[3]:\n    c1, c2 = st.columns(2)\n    if c1.button(\"📧 Test Email\"):\n        if send_email_brevo(\"Test Agent\", \"<h1>Ça marche !</h1>\", TEST_DESTINATAIRE): st.success(\"Email OK\")\n        else: st.error(\"Erreur Email\")\n    if c2.button(\"📱 Test SMS\"):\n        if MACRODROID_URL:\n            num = st.text_input(\"Numéro\")\n            if num and st.button(\"Envoyer\"):\n                send_sms_android(num, \"Test SMS\")\n        else: st.warning(\"Pas de MacroDroid configuré\")\n
+import streamlit as st
+import google.generativeai as genai
+from notion_client import Client
+import pandas as pd
+import requests
+import datetime
+import time
+import threading
+from urllib.parse import quote
+
+# ==============================================================================
+# 1. CONFIGURATION & SECRETS
+# ==============================================================================
+try:
+    # Récupération des clés
+    NOTION_KEY = st.secrets["NOTION_KEY"]
+    NOTION_DB_TASKS = st.secrets["NOTION_DB_TASKS_ID"]
+    NOTION_DB_RAPPELS = st.secrets["NOTION_DB_RAPPELS_ID"]
+    GEMINI_KEY = st.secrets["GEMINI_KEY"]
+    BREVO_KEY = st.secrets["BREVO_KEY"]
+    # Optionnel
+    MACRODROID_URL = st.secrets.get("MACRODROID_URL", "") 
+    
+    # Emails
+    SENDER_EMAIL = st.secrets["SENDER_EMAIL"]
+    TEST_DESTINATAIRE = st.secrets["TEST_DESTINATAIRE"]
+except Exception as e:
+    st.error(f"⚠️ CLÉS MANQUANTES ! Veuillez configurer les 'Secrets'.\nErreur: {e}")
+    st.stop()
+
+# Init API Clients
+notion = Client(auth=NOTION_KEY)
+genai.configure(api_key=GEMINI_KEY)
+
+# ==============================================================================
+# 2. CERVEAU IA (PROMPT SYSTÈME)
+# ==============================================================================
+SYSTEM_PROMPT = """
+Tu es l'IA centrale de l'association Cor-Tech à Cordemais.
+Tu remplaces les bénévoles manquants. Tu es autonome, proactif et expert tech.
+
+TES MISSIONS :
+1. ADMINISTRATIF : Rédiger emails, PV d'AG, dossiers subventions, synthèses PDF.
+2. COM : Créer posts FB/LinkedIn/Twitter, newsletters HTML, communiqués presse.
+3. TECH : Expert 3D, Arduino, Code, Gaming. Tu peux débugger et expliquer.
+4. GESTION : Planning salles, gestion bénévoles, idées ateliers.
+5. VISUEL : Tu sais décrire des images pour les générer.
+
+TON STYLE :
+- Pro mais sympa (Esprit Maker/Asso).
+- Tu signes "Ton Assistant Cor-Tech 🤖".
+- Tu utilises le contexte de l'asso (Lutte fracture numérique, Gaming, Labo Ludik).
+"""
+
+# ==============================================================================
+# 3. FONCTIONS TECHNIQUES
+# ==============================================================================
+
+def send_email_brevo(sujet, html_content, to_email):
+    """Envoie un mail HTML via Brevo"""
+    url = "https://api.brevo.com/v3/smtp/email"
+    payload = {
+        "sender": {"name": "IA Cor-Tech", "email": SENDER_EMAIL},
+        "to": [{"email": to_email}],
+        "subject": sujet,
+        "htmlContent": f"<html><body>{html_content}</body></html>"
+    }
+    headers = {"api-key": BREVO_KEY, "content-type": "application/json"}
+    try:
+        r = requests.post(url, json=payload, headers=headers)
+        return r.status_code == 201
+    except:
+        return False
+
+def send_sms_android(numero, message):
+    """Envoie un SMS via passerelle Android (MacroDroid)"""
+    if not MACRODROID_URL: return False
+    try:
+        clean_num = numero.replace(" ", "").replace(".", "")
+        params = {"param1": clean_num, "param2": message}
+        requests.get(MACRODROID_URL, params=params)
+        return True
+    except:
+        return False
+
+def generate_image_url(prompt):
+    """Génère une image via Pollinations"""
+    encoded = quote(prompt)
+    return f"https://image.pollinations.ai/prompt/{encoded}?nologo=true"
+
+def add_notion_task(nom, responsable, priorite, frequence):
+    try:
+        notion.pages.create(
+            parent={"database_id": NOTION_DB_TASKS},
+            properties={
+                "Nom": {"title": [{"text": {"content": nom}}]},
+                "Responsable": {"rich_text": [{"text": {"content": responsable}}]},
+                "Priorite": {"select": {"name": priorite}},
+                "Frequence": {"select": {"name": frequence}},
+                "Statut": {"status": {"name": "À faire"}}
+            }
+        )
+        return True
+    except: return False
+
+def add_notion_rappel(msg, dest, jour):
+    try:
+        notion.pages.create(
+            parent={"database_id": NOTION_DB_RAPPELS},
+            properties={
+                "Message": {"title": [{"text": {"content": msg}}]},
+                "Destinataire": {"rich_text": [{"text": {"content": dest}}]},
+                "Jour": {"select": {"name": jour}},
+                "Actif": {"checkbox": True}
+            }
+        )
+        return True
+    except: return False
+
+# ==============================================================================
+# 4. MOTEUR D'AUTOMATISATION
+# ==============================================================================
+@st.cache_resource
+def start_daily_scheduler():
+    def scheduler_loop():
+        print("⏰ Démarrage du Cron Job interne...")
+        last_check_date = None
+        while True:
+            now = datetime.datetime.now()
+            today_str = now.strftime("%Y-%m-%d")
+            # Vérification quotidienne à partir de 9h
+            if last_check_date != today_str and now.hour >= 9:
+                print(f"--- Tâches auto du {today_str} ---")
+                jours_fr = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"]
+                jour_actuel = jours_fr[now.weekday()]
+                try:
+                    query = notion.databases.query(
+                        database_id=NOTION_DB_RAPPELS,
+                        filter={"and": [{"property": "Actif", "checkbox": {"equals": True}}, {"property": "Jour", "select": {"equals": jour_actuel}}]}
+                    )
+                    results = query.get("results", [])
+                    for page in results:
+                        props = page["properties"]
+                        msg = props["Message"]["title"][0]["text"]["content"]
+                        dest = props["Destinataire"]["rich_text"][0]["text"]["content"]
+                        send_email_brevo(f"🔔 Rappel Cor-Tech : {msg}", f"<p>C'est {jour_actuel}, pense à : <b>{msg}</b></p>", dest)
+                        print(f"✅ Rappel envoyé à {dest}")
+                except Exception as e:
+                    print(f"❌ Erreur Scheduler : {e}")
+                last_check_date = today_str
+            time.sleep(3600) 
+    t = threading.Thread(target=scheduler_loop, daemon=True)
+    t.start()
+    return t
+
+start_daily_scheduler()
+
+# ==============================================================================
+# 5. INTERFACE GRAPHIQUE
+# ==============================================================================
+st.set_page_config(page_title="Cor-Tech OS", page_icon="🤖", layout="wide")
+
+st.title("🚀 Cor-Tech : Centre de Commandement")
+st.caption("Agent Autonome Actif • Surveillance des rappels en cours...")
+
+tabs = st.tabs(["💬 Assistant", "🛠️ Tâches", "⏰ Rappels", "⚙️ Admin"])
+
+# --- TAB 1 : CHAT ---
+with tabs[0]:
+    st.info("💡 Commandes : 'Visuel pour l'atelier', 'Rédige un mail', 'Synthétise'...")
+    if "messages" not in st.session_state: st.session_state.messages = []
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            if "image" in msg: st.image(msg["image"])
+            st.markdown(msg["content"])
+            
+    if prompt := st.chat_input("Votre ordre ?"):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"): st.markdown(prompt)
+        
+        # --- MODÈLE GEMINI 1.5 FLASH (Plus stable et rapide) ---
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        
+        if "visuel" in prompt.lower() or "affiche" in prompt.lower() or "image" in prompt.lower():
+            prompt_img_gen = f"Crée une description en anglais courte (prompt) pour générer une image : {prompt}"
+            img_desc = model.generate_content(prompt_img_gen).text
+            img_url = generate_image_url(img_desc)
+            with st.chat_message("assistant"):
+                st.image(img_url, caption="Visuel généré par IA")
+                st.markdown(f"[Télécharger]({img_url})")
+            st.session_state.messages.append({"role": "assistant", "content": "Visuel généré.", "image": img_url})
+        else:
+            try:
+                response = model.generate_content(f"{SYSTEM_PROMPT}\nHistorique: {st.session_state.messages}\nUser: {prompt}")
+                with st.chat_message("assistant"): st.markdown(response.text)
+                st.session_state.messages.append({"role": "assistant", "content": response.text})
+            except Exception as e:
+                st.error(f"Erreur Gemini : {e}")
+
+# --- TAB 2 : TACHES ---
+with tabs[1]:
+    with st.form("tache"):
+        c1, c2 = st.columns(2)
+        n = c1.text_input("Quoi faire ?")
+        r = c2.text_input("Qui ?", "Sébastien")
+        p = c1.selectbox("Priorité", ["Moyenne", "Haute", "Urgente"])
+        f = c2.selectbox("Fréquence", ["Ponctuel", "Hebdo"])
+        if st.form_submit_button("Ajouter"):
+            if add_notion_task(n, r, p, f): st.success("✅ Tâche ajoutée")
+            else: st.error("Erreur Notion")
+
+# --- TAB 3 : RAPPELS ---
+with tabs[2]:
+    with st.form("rappel"):
+        c1, c2 = st.columns(2)
+        m = c1.text_input("Message")
+        d = c2.text_input("Email", TEST_DESTINATAIRE)
+        j = st.selectbox("Jour", ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"])
+        if st.form_submit_button("Programmer"):
+            if add_notion_rappel(m, d, j): st.success("✅ Rituel programmé")
+            else: st.error("Erreur Notion")
+            
+    if st.button("Voir les rituels actifs"):
+        try:
+            res = notion.databases.query(database_id=NOTION_DB_RAPPELS, filter={"property": "Actif", "checkbox": {"equals": True}})
+            for pg in res["results"]:
+                st.text(f"📅 {pg['properties']['Jour']['select']['name']} : {pg['properties']['Message']['title'][0]['text']['content']}")
+        except: st.warning("Rien à afficher")
+
+# --- TAB 4 : ADMIN ---
+with tabs[3]:
+    c1, c2 = st.columns(2)
+    if c1.button("📧 Test Email"):
+        if send_email_brevo("Test Agent", "<h1>Ça marche !</h1>", TEST_DESTINATAIRE): st.success("Email OK")
+        else: st.error("Erreur Email")
+    if c2.button("📱 Test SMS"):
+        if MACRODROID_URL:
+            num = st.text_input("Numéro")
+            if num and st.button("Envoyer"):
+                send_sms_android(num, "Test SMS")
+        else: st.warning("Pas de MacroDroid configuré")
