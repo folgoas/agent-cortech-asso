@@ -213,7 +213,7 @@ with tabs[0]:
         with st.chat_message("user"): st.markdown(prompt)
         
         # Logique IA + Image
-        model = genai.GenerativeModel('gemini-pro')
+        model = genai.GenerativeModel('gemini-1.5-flash')
         
         # Détection d'intention "Image"
         if "visuel" in prompt.lower() or "affiche" in prompt.lower() or "image" in prompt.lower():
