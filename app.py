@@ -1,5 +1,5 @@
 import streamlit as st
-import google.generativeai as genai
+from mistralai import Mistral
 from notion_client import Client
 import pandas as pd
 import requests
@@ -16,8 +16,9 @@ try:
     NOTION_KEY = st.secrets["NOTION_KEY"]
     NOTION_DB_TASKS = st.secrets["NOTION_DB_TASKS_ID"]
     NOTION_DB_RAPPELS = st.secrets["NOTION_DB_RAPPELS_ID"]
-    GEMINI_KEY = st.secrets["GEMINI_KEY"]
+    MISTRAL_API_KEY = st.secrets["MISTRAL_API_KEY"] # Nouvelle clé
     BREVO_KEY = st.secrets["BREVO_KEY"]
+    
     # Optionnel
     MACRODROID_URL = st.secrets.get("MACRODROID_URL", "") 
     
@@ -30,7 +31,7 @@ except Exception as e:
 
 # Init API Clients
 notion = Client(auth=NOTION_KEY)
-genai.configure(api_key=GEMINI_KEY)
+mistral_client = Mistral(api_key=MISTRAL_API_KEY) # Init Mistral
 
 # ==============================================================================
 # 2. CERVEAU IA (PROMPT SYSTÈME)
@@ -161,7 +162,7 @@ start_daily_scheduler()
 st.set_page_config(page_title="Cor-Tech OS", page_icon="🤖", layout="wide")
 
 st.title("🚀 Cor-Tech : Centre de Commandement")
-st.caption("Agent Autonome Actif • Surveillance des rappels en cours...")
+st.caption(f"Propulsé par Mistral AI 🇫🇷 • Surveillance active...")
 
 tabs = st.tabs(["💬 Assistant", "🛠️ Tâches", "⏰ Rappels", "⚙️ Admin"])
 
@@ -169,6 +170,8 @@ tabs = st.tabs(["💬 Assistant", "🛠️ Tâches", "⏰ Rappels", "⚙️ Admi
 with tabs[0]:
     st.info("💡 Commandes : 'Visuel pour l'atelier', 'Rédige un mail', 'Synthétise'...")
     if "messages" not in st.session_state: st.session_state.messages = []
+    
+    # Affichage historique
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             if "image" in msg: st.image(msg["image"])
@@ -178,24 +181,52 @@ with tabs[0]:
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"): st.markdown(prompt)
         
-        # --- MODÈLE GEMINI 1.5 FLASH (Plus stable et rapide) ---
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        # --- LOGIQUE MISTRAL ---
         
+        # 1. Gestion des Images (On garde Pollinations, mais c'est Mistral qui écrit le prompt)
         if "visuel" in prompt.lower() or "affiche" in prompt.lower() or "image" in prompt.lower():
-            prompt_img_gen = f"Crée une description en anglais courte (prompt) pour générer une image : {prompt}"
-            img_desc = model.generate_content(prompt_img_gen).text
-            img_url = generate_image_url(img_desc)
-            with st.chat_message("assistant"):
-                st.image(img_url, caption="Visuel généré par IA")
-                st.markdown(f"[Télécharger]({img_url})")
-            st.session_state.messages.append({"role": "assistant", "content": "Visuel généré.", "image": img_url})
+            # On demande à Mistral de créer le prompt anglais
+            try:
+                chat_response = mistral_client.chat.complete(
+                    model="mistral-large-latest",
+                    messages=[
+                        {"role": "system", "content": "Tu es un expert en art digital. Traduis la demande en un prompt court en anglais pour un générateur d'image."},
+                        {"role": "user", "content": prompt}
+                    ]
+                )
+                img_desc = chat_response.choices[0].message.content
+                img_url = generate_image_url(img_desc)
+                
+                with st.chat_message("assistant"):
+                    st.image(img_url, caption="Visuel généré par IA")
+                    st.markdown(f"[Télécharger]({img_url})")
+                st.session_state.messages.append({"role": "assistant", "content": "Visuel généré.", "image": img_url})
+            except Exception as e:
+                st.error(f"Erreur Image : {e}")
+
+        # 2. Gestion Texte Classique
         else:
             try:
-                response = model.generate_content(f"{SYSTEM_PROMPT}\nHistorique: {st.session_state.messages}\nUser: {prompt}")
-                with st.chat_message("assistant"): st.markdown(response.text)
-                st.session_state.messages.append({"role": "assistant", "content": response.text})
+                # On prépare l'historique pour Mistral
+                messages_for_mistral = [{"role": "system", "content": SYSTEM_PROMPT}]
+                # On ajoute l'historique de session (en filtrant les images)
+                for m in st.session_state.messages:
+                    if "image" not in m: # On n'envoie pas les images à Mistral (texte uniquement)
+                        messages_for_mistral.append({"role": m["role"], "content": m["content"]})
+                
+                # Appel API Mistral
+                chat_response = mistral_client.chat.complete(
+                    model="mistral-large-latest", # Le meilleur modèle
+                    messages=messages_for_mistral
+                )
+                
+                ai_reply = chat_response.choices[0].message.content
+                
+                with st.chat_message("assistant"): st.markdown(ai_reply)
+                st.session_state.messages.append({"role": "assistant", "content": ai_reply})
+                
             except Exception as e:
-                st.error(f"Erreur Gemini : {e}")
+                st.error(f"Erreur Mistral AI : {e}")
 
 # --- TAB 2 : TACHES ---
 with tabs[1]:
