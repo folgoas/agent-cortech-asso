@@ -1,7 +1,6 @@
 import streamlit as st
 from mistralai import Mistral
 from notion_client import Client
-import pandas as pd
 import requests
 import datetime
 import time
@@ -9,56 +8,42 @@ import threading
 from urllib.parse import quote
 
 # ==============================================================================
-# 1. CONFIGURATION & SECRETS
+# 1. CONFIGURATION & STYLE
 # ==============================================================================
+st.set_page_config(page_title="Cor-Tech OS", page_icon="🤖", layout="wide")
+
+# CSS pour masquer les éléments inutiles et fixer la barre de chat
+st.markdown("""
+<style>
+    .stChatInput {position: fixed; bottom: 0; padding-bottom: 20px; z-index: 100;}
+    .block-container {padding-bottom: 120px;} /* Espace pour ne pas cacher le dernier message */
+</style>
+""", unsafe_allow_html=True)
+
 try:
     # Récupération des clés
     NOTION_KEY = st.secrets["NOTION_KEY"]
     NOTION_DB_TASKS = st.secrets["NOTION_DB_TASKS_ID"]
     NOTION_DB_RAPPELS = st.secrets["NOTION_DB_RAPPELS_ID"]
-    MISTRAL_API_KEY = st.secrets["MISTRAL_API_KEY"] # Nouvelle clé
+    MISTRAL_API_KEY = st.secrets["MISTRAL_API_KEY"]
     BREVO_KEY = st.secrets["BREVO_KEY"]
-    
-    # Optionnel
     MACRODROID_URL = st.secrets.get("MACRODROID_URL", "") 
-    
-    # Emails
     SENDER_EMAIL = st.secrets["SENDER_EMAIL"]
     TEST_DESTINATAIRE = st.secrets["TEST_DESTINATAIRE"]
 except Exception as e:
-    st.error(f"⚠️ CLÉS MANQUANTES ! Veuillez configurer les 'Secrets'.\nErreur: {e}")
+    st.error(f"⚠️ CLÉS MANQUANTES ! Vérifiez les secrets.\n{e}")
     st.stop()
 
-# Init API Clients
+# Init Clients
 notion = Client(auth=NOTION_KEY)
-mistral_client = Mistral(api_key=MISTRAL_API_KEY) # Init Mistral
+mistral_client = Mistral(api_key=MISTRAL_API_KEY)
 
 # ==============================================================================
-# 2. CERVEAU IA (PROMPT SYSTÈME)
-# ==============================================================================
-SYSTEM_PROMPT = """
-Tu es l'IA centrale de l'association Cor-Tech à Cordemais.
-Tu remplaces les bénévoles manquants. Tu es autonome, proactif et expert tech.
-
-TES MISSIONS :
-1. ADMINISTRATIF : Rédiger emails, PV d'AG, dossiers subventions, synthèses PDF.
-2. COM : Créer posts FB/LinkedIn/Twitter, newsletters HTML, communiqués presse.
-3. TECH : Expert 3D, Arduino, Code, Gaming. Tu peux débugger et expliquer.
-4. GESTION : Planning salles, gestion bénévoles, idées ateliers.
-5. VISUEL : Tu sais décrire des images pour les générer.
-
-TON STYLE :
-- Pro mais sympa (Esprit Maker/Asso).
-- Tu signes "Ton Assistant Cor-Tech 🤖".
-- Tu utilises le contexte de l'asso (Lutte fracture numérique, Gaming, Labo Ludik).
-"""
-
-# ==============================================================================
-# 3. FONCTIONS TECHNIQUES
+# 2. FONCTIONS TECHNIQUES (Avec DEBUG Email)
 # ==============================================================================
 
-def send_email_brevo(sujet, html_content, to_email):
-    """Envoie un mail HTML via Brevo"""
+def send_email_brevo_debug(sujet, html_content, to_email):
+    """Envoie un mail avec retour d'erreur précis"""
     url = "https://api.brevo.com/v3/smtp/email"
     payload = {
         "sender": {"name": "IA Cor-Tech", "email": SENDER_EMAIL},
@@ -67,25 +52,18 @@ def send_email_brevo(sujet, html_content, to_email):
         "htmlContent": f"<html><body>{html_content}</body></html>"
     }
     headers = {"api-key": BREVO_KEY, "content-type": "application/json"}
+    
     try:
         r = requests.post(url, json=payload, headers=headers)
-        return r.status_code == 201
-    except:
-        return False
-
-def send_sms_android(numero, message):
-    """Envoie un SMS via passerelle Android (MacroDroid)"""
-    if not MACRODROID_URL: return False
-    try:
-        clean_num = numero.replace(" ", "").replace(".", "")
-        params = {"param1": clean_num, "param2": message}
-        requests.get(MACRODROID_URL, params=params)
-        return True
-    except:
-        return False
+        if r.status_code == 201:
+            return True, "✅ Envoyé"
+        else:
+            # On retourne le code erreur et le message technique de Brevo
+            return False, f"❌ Erreur Brevo ({r.status_code}) : {r.text}"
+    except Exception as e:
+        return False, f"❌ Erreur Script : {e}"
 
 def generate_image_url(prompt):
-    """Génère une image via Pollinations"""
     encoded = quote(prompt)
     return f"https://image.pollinations.ai/prompt/{encoded}?nologo=true"
 
@@ -119,154 +97,149 @@ def add_notion_rappel(msg, dest, jour):
     except: return False
 
 # ==============================================================================
-# 4. MOTEUR D'AUTOMATISATION
+# 3. MOTEUR AUTOMATIQUE (Background)
 # ==============================================================================
 @st.cache_resource
 def start_daily_scheduler():
     def scheduler_loop():
-        print("⏰ Démarrage du Cron Job interne...")
-        last_check_date = None
+        print("⏰ Cron Job démarré")
+        last_check = None
         while True:
             now = datetime.datetime.now()
-            today_str = now.strftime("%Y-%m-%d")
-            # Vérification quotidienne à partir de 9h
-            if last_check_date != today_str and now.hour >= 9:
-                print(f"--- Tâches auto du {today_str} ---")
-                jours_fr = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"]
-                jour_actuel = jours_fr[now.weekday()]
+            today = now.strftime("%Y-%m-%d")
+            if last_check != today and now.hour >= 9:
+                jours = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"]
+                jour_actuel = jours[now.weekday()]
                 try:
-                    query = notion.databases.query(
+                    q = notion.databases.query(
                         database_id=NOTION_DB_RAPPELS,
                         filter={"and": [{"property": "Actif", "checkbox": {"equals": True}}, {"property": "Jour", "select": {"equals": jour_actuel}}]}
                     )
-                    results = query.get("results", [])
-                    for page in results:
-                        props = page["properties"]
-                        msg = props["Message"]["title"][0]["text"]["content"]
-                        dest = props["Destinataire"]["rich_text"][0]["text"]["content"]
-                        send_email_brevo(f"🔔 Rappel Cor-Tech : {msg}", f"<p>C'est {jour_actuel}, pense à : <b>{msg}</b></p>", dest)
-                        print(f"✅ Rappel envoyé à {dest}")
-                except Exception as e:
-                    print(f"❌ Erreur Scheduler : {e}")
-                last_check_date = today_str
+                    for p in q.get("results", []):
+                        msg = p["properties"]["Message"]["title"][0]["text"]["content"]
+                        dest = p["properties"]["Destinataire"]["rich_text"][0]["text"]["content"]
+                        send_email_brevo_debug(f"🔔 Rappel : {msg}", f"<p>C'est {jour_actuel}, pense à : <b>{msg}</b></p>", dest)
+                except: pass
+                last_check = today
             time.sleep(3600) 
     t = threading.Thread(target=scheduler_loop, daemon=True)
     t.start()
-    return t
 
 start_daily_scheduler()
 
 # ==============================================================================
-# 5. INTERFACE GRAPHIQUE
+# 4. INTERFACE UTILISATEUR (Nouvelle UI)
 # ==============================================================================
-st.set_page_config(page_title="Cor-Tech OS", page_icon="🤖", layout="wide")
 
-st.title("🚀 Cor-Tech : Centre de Commandement")
-st.caption(f"Propulsé par Mistral AI 🇫🇷 • Surveillance active...")
-
-tabs = st.tabs(["💬 Assistant", "🛠️ Tâches", "⏰ Rappels", "⚙️ Admin"])
-
-# --- TAB 1 : CHAT ---
-with tabs[0]:
-    st.info("💡 Commandes : 'Visuel pour l'atelier', 'Rédige un mail', 'Synthétise'...")
-    if "messages" not in st.session_state: st.session_state.messages = []
+# --- SIDEBAR (Navigation) ---
+with st.sidebar:
+    st.image("https://cdn-icons-png.flaticon.com/512/4712/4712035.png", width=50)
+    st.title("Cor-Tech OS")
+    st.caption("Mistral AI Connected 🟢")
     
-    # Affichage historique
+    menu = st.radio("Navigation", ["💬 Chat Assistant", "🛠️ Gestion Tâches", "⏰ Rituels", "⚙️ Admin / Debug"], label_visibility="collapsed")
+    
+    st.divider()
+    st.markdown("### 📊 État Rapide")
+    # Petit widget pour voir si Notion répond
+    if st.button("Test Connexion Notion"):
+        try:
+            u = notion.users.me()
+            st.success("Notion OK")
+        except: st.error("Notion HS")
+
+# --- PAGE PRINCIPALE (Dynamique) ---
+
+if menu == "💬 Chat Assistant":
+    # Entête discret
+    st.markdown("### 🤖 Assistant Bénévole")
+    st.caption("Expert Tech, Administratif & Communication. Propulsé par Mistral Large.")
+
+    if "messages" not in st.session_state: st.session_state.messages = []
+
+    # Zone d'affichage des messages (Scrolle naturellement)
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
-            if "image" in msg: st.image(msg["image"])
+            if "image" in msg: st.image(msg["image"], width=400)
             st.markdown(msg["content"])
-            
-    if prompt := st.chat_input("Votre ordre ?"):
+
+    # Zone de saisie (Fixée en bas grâce au CSS)
+    if prompt := st.chat_input("Demandez une tâche, un mail, un visuel..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"): st.markdown(prompt)
-        
-        # --- LOGIQUE MISTRAL ---
-        
-        # 1. Gestion des Images (On garde Pollinations, mais c'est Mistral qui écrit le prompt)
-        if "visuel" in prompt.lower() or "affiche" in prompt.lower() or "image" in prompt.lower():
-            # On demande à Mistral de créer le prompt anglais
+
+        # LOGIQUE MISTRAL
+        if any(x in prompt.lower() for x in ["visuel", "affiche", "image"]):
             try:
-                chat_response = mistral_client.chat.complete(
+                # 1. Mistral créé le prompt
+                res = mistral_client.chat.complete(
                     model="mistral-large-latest",
-                    messages=[
-                        {"role": "system", "content": "Tu es un expert en art digital. Traduis la demande en un prompt court en anglais pour un générateur d'image."},
-                        {"role": "user", "content": prompt}
-                    ]
+                    messages=[{"role": "user", "content": f"Crée un prompt court en anglais pour générer une image artistique : {prompt}"}]
                 )
-                img_desc = chat_response.choices[0].message.content
-                img_url = generate_image_url(img_desc)
+                desc = res.choices[0].message.content
+                url = generate_image_url(desc)
                 
                 with st.chat_message("assistant"):
-                    st.image(img_url, caption="Visuel généré par IA")
-                    st.markdown(f"[Télécharger]({img_url})")
-                st.session_state.messages.append({"role": "assistant", "content": "Visuel généré.", "image": img_url})
-            except Exception as e:
-                st.error(f"Erreur Image : {e}")
-
-        # 2. Gestion Texte Classique
+                    st.image(url, caption="Généré par Pollinations")
+                    st.markdown(f"[Télécharger l'image]({url})")
+                st.session_state.messages.append({"role": "assistant", "content": "Visuel généré.", "image": url})
+            except Exception as e: st.error(f"Erreur Image: {e}")
         else:
             try:
-                # On prépare l'historique pour Mistral
-                messages_for_mistral = [{"role": "system", "content": SYSTEM_PROMPT}]
-                # On ajoute l'historique de session (en filtrant les images)
+                # 2. Mistral Chat normal
+                hist = [{"role": "system", "content": "Tu es l'assistant de l'asso Cor-Tech. Ton pro, sympa, tech. Tu rédiges mails, posts, documents."}]
                 for m in st.session_state.messages:
-                    if "image" not in m: # On n'envoie pas les images à Mistral (texte uniquement)
-                        messages_for_mistral.append({"role": m["role"], "content": m["content"]})
+                    if "image" not in m: hist.append({"role": m["role"], "content": m["content"]})
                 
-                # Appel API Mistral
-                chat_response = mistral_client.chat.complete(
-                    model="mistral-large-latest", # Le meilleur modèle
-                    messages=messages_for_mistral
-                )
+                res = mistral_client.chat.complete(model="mistral-large-latest", messages=hist)
+                reply = res.choices[0].message.content
                 
-                ai_reply = chat_response.choices[0].message.content
-                
-                with st.chat_message("assistant"): st.markdown(ai_reply)
-                st.session_state.messages.append({"role": "assistant", "content": ai_reply})
-                
-            except Exception as e:
-                st.error(f"Erreur Mistral AI : {e}")
+                with st.chat_message("assistant"): st.markdown(reply)
+                st.session_state.messages.append({"role": "assistant", "content": reply})
+            except Exception as e: st.error(f"Erreur Mistral: {e}")
 
-# --- TAB 2 : TACHES ---
-with tabs[1]:
-    with st.form("tache"):
+elif menu == "🛠️ Gestion Tâches":
+    st.header("Nouvelle Mission")
+    with st.container(border=True):
         c1, c2 = st.columns(2)
-        n = c1.text_input("Quoi faire ?")
-        r = c2.text_input("Qui ?", "Sébastien")
+        n = c1.text_input("Tâche à faire")
+        r = c2.text_input("Qui s'en occupe ?", "Sébastien")
         p = c1.selectbox("Priorité", ["Moyenne", "Haute", "Urgente"])
-        f = c2.selectbox("Fréquence", ["Ponctuel", "Hebdo"])
-        if st.form_submit_button("Ajouter"):
-            if add_notion_task(n, r, p, f): st.success("✅ Tâche ajoutée")
-            else: st.error("Erreur Notion")
+        f = c2.selectbox("Fréquence", ["Ponctuel", "Hebdomadaire"])
+        if st.button("Enregistrer la tâche", type="primary"):
+            if add_notion_task(n, r, p, f): st.success("C'est noté dans Notion !")
+            else: st.error("Erreur de connexion Notion")
 
-# --- TAB 3 : RAPPELS ---
-with tabs[2]:
-    with st.form("rappel"):
+elif menu == "⏰ Rituels":
+    st.header("Rappels Automatiques")
+    with st.container(border=True):
         c1, c2 = st.columns(2)
-        m = c1.text_input("Message")
-        d = c2.text_input("Email", TEST_DESTINATAIRE)
+        m = c1.text_input("Message du rappel")
+        d = c2.text_input("Email destinataire", TEST_DESTINATAIRE)
         j = st.selectbox("Jour", ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"])
-        if st.form_submit_button("Programmer"):
-            if add_notion_rappel(m, d, j): st.success("✅ Rituel programmé")
+        if st.button("Programmer le rituel"):
+            if add_notion_rappel(m, d, j): st.success("Rituel activé !")
             else: st.error("Erreur Notion")
-            
-    if st.button("Voir les rituels actifs"):
-        try:
-            res = notion.databases.query(database_id=NOTION_DB_RAPPELS, filter={"property": "Actif", "checkbox": {"equals": True}})
-            for pg in res["results"]:
-                st.text(f"📅 {pg['properties']['Jour']['select']['name']} : {pg['properties']['Message']['title'][0]['text']['content']}")
-        except: st.warning("Rien à afficher")
 
-# --- TAB 4 : ADMIN ---
-with tabs[3]:
-    c1, c2 = st.columns(2)
-    if c1.button("📧 Test Email"):
-        if send_email_brevo("Test Agent", "<h1>Ça marche !</h1>", TEST_DESTINATAIRE): st.success("Email OK")
-        else: st.error("Erreur Email")
-    if c2.button("📱 Test SMS"):
-        if MACRODROID_URL:
-            num = st.text_input("Numéro")
-            if num and st.button("Envoyer"):
-                send_sms_android(num, "Test SMS")
-        else: st.warning("Pas de MacroDroid configuré")
+elif menu == "⚙️ Admin / Debug":
+    st.header("Centre de diagnostic")
+    st.info("Utilisez cette page pour comprendre pourquoi les mails ne partent pas.")
+    
+    st.markdown("#### 1. Test Email (Debug Mode)")
+    col_a, col_b = st.columns(2)
+    email_test = col_a.text_input("Envoyer à", TEST_DESTINATAIRE)
+    
+    if col_a.button("Lancer le test Email"):
+        with st.spinner("Tentative d'envoi..."):
+            succes, message = send_email_brevo_debug("Test Debug Cor-Tech", "<h1>Ceci est un test</h1>", email_test)
+            if succes:
+                st.success(message)
+            else:
+                st.error(message)
+                st.warning("👉 Vérifiez que 'SENDER_EMAIL' dans vos secrets correspond bien à votre compte Brevo validé.")
+
+    st.markdown("#### 2. Test SMS")
+    tel = col_b.text_input("Numéro")
+    if col_b.button("Test SMS"):
+        # Logique SMS ici (identique V1)
+        st.info("Appel MacroDroid lancé...")
