@@ -1,5 +1,5 @@
 streamlit
-google-generativeai
+mistralai
 notion-client
 pandas
 requests
