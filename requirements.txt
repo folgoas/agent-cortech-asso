@@ -1,0 +1,5 @@
+streamlit
+google-generativeai
+notion-client
+pandas
+requests
